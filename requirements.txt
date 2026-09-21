@@ -1,0 +1,8 @@
+# Owner: Claude. Plan §2, §11.
+# Pinned versions added when the code lands. Intended contents:
+#   requests        — SODA HTTP client (ingest/soda.py)
+#   pandas          — metrics and KPI computation (scoring/)
+#   anthropic       — Claude tool-use loop (agent/agent.py)
+#   streamlit       — chat UI (app.py)
+#   python-dotenv   — loads .env
+#   pytest          — tests/

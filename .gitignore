@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.streamlit/secrets.toml
+# accidental npm install — see README; safe to delete these entirely
+node_modules/
+package.json
+package-lock.json
