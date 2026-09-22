@@ -64,8 +64,3 @@ docs/       the real answers, for review
 pytest -v                       # 33 tests: data assumptions, scoring, one per analyst question, the agent loop (stubbed)
 python -m scripts.answer_bank   # real numbers for 22 questions → docs/answers-<date>.md
 ```
-
-## Housekeeping
-
-`node_modules/`, `package.json` and `package-lock.json`, if present, are leftovers of an accidental
-`npm install` and are not part of the project (they are gitignored).
