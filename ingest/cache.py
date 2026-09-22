@@ -68,29 +68,22 @@ CREATE TABLE IF NOT EXISTS monthly (
 );
 """
 
+# One-row bookkeeping table. `full_fetch_at` is written only when a WHOLE-TABLE fetch completes, so
+# get_monthly_all can tell a complete snapshot from a cache that merely holds a few airports fetched
+# individually. Age alone cannot tell those apart (one airport fetched today looks "fresh").
+META_DDL = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
 
-# ──────────────────────────────────────────────────────────────────────────────
+
 # _connect() -> sqlite3.Connection
-#
-# Opens data/airports.db (creating the data/ folder and the file if missing), runs the CREATE TABLE
-# IF NOT EXISTS statement — a no-op when the table already exists — and returns the connection.
-# Every public function starts here, so nothing ever assumes the DB was set up in advance.
-# Callers must close the connection (they do, in a `finally`).
-# ──────────────────────────────────────────────────────────────────────────────
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(DDL)
+    conn.execute(META_DDL)
     return conn
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _states() -> dict[str, str]
-#
-# Reads data/airport_states.csv (two columns: code,state — written by build_db.build_states_csv)
-# and returns it as a dictionary {"BOS": "MA", "LAX": "CA", ...}. If the file does not exist yet,
-# returns an empty dict, so the rest of the pipeline works before the lookup has been built.
-# ──────────────────────────────────────────────────────────────────────────────
 def _states() -> dict[str, str]:
     if not STATES_PATH.exists():
         return {}
@@ -98,35 +91,14 @@ def _states() -> dict[str, str]:
     return dict(zip(s["code"], s["state"]))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _with_state(df) -> DataFrame
-#
-# Takes a frame WITHOUT a state column and returns a copy WITH one: for each row, look up its
-# `code` in the _states() dictionary. Codes not in the lookup (tiny fields without an IATA code)
-# get NaN — no error. This runs at read time on every public return path, which is how rows
-# cached before the CSV existed still come back with a state.
-# ──────────────────────────────────────────────────────────────────────────────
 def _with_state(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["state"] = df["code"].map(_states())
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _to_frame(rows) -> DataFrame
-#
-# Turns BTS's raw answer (a list of dicts, every value a string) into our clean, typed table:
-#   1. DataFrame from the rows.
-#   2. Keep only the columns named in RENAME_MAP and rename them (outbound_international_3 ->
-#      intl_avg_stage_sm). Everything unmapped is dropped here.
-#   3. Convert every numeric column from text to numbers. errors="coerce" turns a blank or
-#      malformed value into NaN instead of raising. This is the step that makes `passengers > seats`
-#      a numeric comparison rather than an alphabetical one.
-#   4. Trim `month` from "2026-04-01T00:00:00.000" to "2026-04-01".
-#   5. Stamp `fetched_at` = now, ISO text — the column the freshness rule reads later.
-#   6. Return the columns in COLUMNS order so the frame lines up with the table.
-# An empty input returns an empty frame with the right columns, so callers never special-case it.
-# ──────────────────────────────────────────────────────────────────────────────
 def _to_frame(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=COLUMNS)
@@ -139,15 +111,7 @@ def _to_frame(rows: list[dict]) -> pd.DataFrame:
     return df[COLUMNS]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _upsert(conn, df) -> None
-#
-# Writes the frame into the `monthly` table with INSERT OR REPLACE, one row at a time via
-# executemany. Because the primary key is (code, month), writing BOS April 2026 a second time
-# overwrites the first — a refetch picks up BTS revisions instead of creating a duplicate month.
-# The astype/where line converts pandas NaN into Python None first, because SQLite understands
-# NULL but not NaN. Commits at the end; an empty frame is a no-op.
-# ──────────────────────────────────────────────────────────────────────────────
 def _upsert(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -158,14 +122,7 @@ def _upsert(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
     conn.commit()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _read(conn, since, code) -> DataFrame
-#
-# SELECT from `monthly`: months on or after `since`, and one airport if `code` is given or all
-# airports if it is None. Values go in as `?` placeholders, never string-formatted — that is the
-# safe way to put values into SQL. Sorted by code then month. Returns an empty frame when nothing
-# matches (which is what triggers a live fetch upstream).
-# ──────────────────────────────────────────────────────────────────────────────
 def _read(conn: sqlite3.Connection, since: str, code: str | None) -> pd.DataFrame:
     sql = "SELECT * FROM monthly WHERE month >= ?"
     params: list = [since]
@@ -175,15 +132,7 @@ def _read(conn: sqlite3.Connection, since: str, code: str | None) -> pd.DataFram
     return pd.read_sql(sql + " ORDER BY code, month", conn, params=params)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _is_fresh(df, max_age_days) -> bool
-#
-# The yes/no at the heart of the cache: "can I use these cached rows, or must I go to BTS?"
-# Fresh means: rows exist AND the OLDEST fetched_at among them is within max_age_days of now.
-# Oldest rather than newest so the all-airports cache is never a patchwork of ages.
-# max_age_days < 0 is defined as "never fresh" — that single rule is how refresh() forces a live
-# call without any extra code.
-# ──────────────────────────────────────────────────────────────────────────────
 def _is_fresh(df: pd.DataFrame, max_age_days: int) -> bool:
     if df.empty or max_age_days < 0:
         return False
@@ -191,14 +140,7 @@ def _is_fresh(df: pd.DataFrame, max_age_days: int) -> bool:
     return datetime.now() - oldest <= timedelta(days=max_age_days)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # _validate_code(code) -> str
-#
-# The guard at the boundary. Strips whitespace, uppercases, and requires exactly three letters or
-# digits (BTS uses codes like "01A" for tiny fields, hence digits). Anything else raises ValueError.
-# It matters because later `code` arrives from the LLM's tool call and is interpolated into a SoQL
-# string; validating once here is what keeps a malformed argument from becoming a malformed query.
-# ──────────────────────────────────────────────────────────────────────────────
 def _validate_code(code: str) -> str:
     code = code.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{3}", code):
@@ -206,14 +148,20 @@ def _validate_code(code: str) -> str:
     return code
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# _full_fetch_at(conn) -> datetime | None
+def _full_fetch_at(conn: sqlite3.Connection):
+    row = conn.execute("SELECT value FROM meta WHERE key = 'full_fetch_at'").fetchone()
+    return datetime.fromisoformat(row[0]) if row else None
+
+
+# _mark_full_fetch(conn) -> None
+def _mark_full_fetch(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('full_fetch_at', ?)",
+                 (datetime.now().isoformat(timespec="seconds"),))
+    conn.commit()
+
+
 # _fetch_live(conn, since, code) -> DataFrame
-#
-# The cache-miss path, packaged as one step so both public functions share it:
-#   build the SoQL $where (reporting_month >= since, plus the airport filter if any) and a $select
-#   listing only the BTS fields we keep (a much smaller payload than the full row) → soda.fetch →
-#   _to_frame → _upsert → return the clean frame.
-# ──────────────────────────────────────────────────────────────────────────────
 def _fetch_live(conn: sqlite3.Connection, since: str, code: str | None) -> pd.DataFrame:
     where = f"reporting_month >= '{since}'"
     if code is not None:
@@ -221,19 +169,12 @@ def _fetch_live(conn: sqlite3.Connection, since: str, code: str | None) -> pd.Da
     rows = fetch(DATASET, **{"$where": where, "$select": ",".join(RENAME_MAP)})
     df = _to_frame(rows)
     _upsert(conn, df)
+    if code is None:
+        _mark_full_fetch(conn)
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # get_monthly(code, since="2019-01-01", max_age_days=30) -> (DataFrame, source)
-#
-# PUBLIC. One airport's monthly rows. The sentence the whole file exists for:
-#   validate the code → open the DB → read what is cached → if fresh, return it tagged
-#   "cache, fetched <date>" → otherwise fetch live, store, return tagged "data.bts.gov live".
-# Both return paths go through _with_state so the caller always gets a `state` column.
-# The connection is closed in `finally` so it is released even if something raises halfway.
-# `source` is the second return value; the UI shows it under every answer.
-# ──────────────────────────────────────────────────────────────────────────────
 def get_monthly(code: str, since: str = "2019-01-01", max_age_days: int = 30) -> tuple[pd.DataFrame, str]:
     code = _validate_code(code)
     conn = _connect()
@@ -246,31 +187,34 @@ def get_monthly(code: str, since: str = "2019-01-01", max_age_days: int = 30) ->
         conn.close()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
 # get_monthly_all(since="2019-01-01", max_age_days=30) -> (DataFrame, source)
-#
-# PUBLIC. The same decision for every airport at once — what the ranking tools need to compute
-# z-scores within hub tiers. If any row is stale, the whole table is refetched in one paginated
-# SODA query (a few 50k-row pages) rather than airport by airport, so the cache is never a mix
-# of ages and BTS sees a handful of requests instead of a thousand.
-# ──────────────────────────────────────────────────────────────────────────────
 def get_monthly_all(since: str = "2019-01-01", max_age_days: int = 30) -> tuple[pd.DataFrame, str]:
     conn = _connect()
     try:
-        df = _read(conn, since, None)
-        if _is_fresh(df, max_age_days):
-            return _with_state(df), f"cache, fetched {df['fetched_at'].max()[:10]}"
+        full = _full_fetch_at(conn)
+        if (full is not None and max_age_days >= 0
+                and datetime.now() - full <= timedelta(days=max_age_days)):
+            df = _read(conn, since, None)
+            return _with_state(df), f"cache, fetched {full.date().isoformat()}"
         return _with_state(_fetch_live(conn, since, None)), "data.bts.gov live"
     finally:
         conn.close()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# snapshot_stamp() -> str
+def snapshot_stamp() -> str:
+    """Cheap identity of the current cache contents: the full-fetch timestamp plus the row count.
+    Callers (agent.tools) key their in-memory scored tables on this instead of re-reading 80k rows
+    on every tool call."""
+    conn = _connect()
+    try:
+        full = _full_fetch_at(conn)
+        n = conn.execute("SELECT COUNT(*) FROM monthly").fetchone()[0]
+        return f"{full.isoformat(timespec='seconds') if full else 'none'}|{n}"
+    finally:
+        conn.close()
+
+
 # refresh(code) -> (DataFrame, source)
-#
-# PUBLIC. Force a live fetch for one airport, bypassing the cache: max_age_days=-1 is never fresh,
-# so get_monthly always takes the live path. Backs airport_profile(refresh=True) — the demo moment
-# "pull the latest for SFO" that proves the API path is real.
-# ──────────────────────────────────────────────────────────────────────────────
 def refresh(code: str) -> tuple[pd.DataFrame, str]:
     return get_monthly(code, max_age_days=-1)

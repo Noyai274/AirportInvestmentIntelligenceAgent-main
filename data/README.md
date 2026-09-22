@@ -9,6 +9,8 @@ airports.db
 
 airport_states.csv
   Static lookup: IATA code → US state, for the region questions (New England = CT, MA, ME, NH,
-  RI, VT). Built once from a public airport list during ingest; committed. r495-tyji has no state
-  field, which is the only reason this file exists.
+  RI, VT). Built by ingest/build_db.py:build_states_csv() from OurAirports
+  (https://davidmegginson.github.io/ourairports-data/airports.csv, public domain): US rows with an
+  IATA code, state = iso_region minus the "US-" prefix. Committed. r495-tyji has no state field,
+  which is the only reason this file exists. NOT stored in airports.db — cache.py joins it at read time.
 -->
